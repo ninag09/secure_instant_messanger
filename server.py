@@ -21,12 +21,14 @@ def signal_handler (signal, frame):
     print "Exiting Main Thread"
     sys.exit(0)
 
+# CleanUp before exiting. Wait for threads to finish jobs and close socket
 def cleanup():
     rThread.shutdown()
     rThread.join()
     serverSock.serverClose()
     print "Shutting down server..."
 
+# Receiver Thread class. Responsible for send/recv client messages
 class receiverThread(threading.Thread):
     def __init__(self, threadId, name, clientSockList):
         threading.Thread.__init__(self)
@@ -51,6 +53,7 @@ class receiverThread(threading.Thread):
         self._shutdown_request = True
         self._is_shutdown.wait()
 
+# Polling for messages and adding it to the message queue
 def receiveMessage():
     pollTimeout = 2#Just for testing purpose
     rList, wList, eList = select.select(clientSockList, outputSockList, clientSockList, pollTimeout)
@@ -82,6 +85,7 @@ def receiveMessage():
         s.close()
         del messageQueues[s]
 
+# Tcp Server class. Responsible for listening and accepting client connections
 class TcpServer:
 
     def __init__(self, serverAddress, MessageHandler):
@@ -112,31 +116,35 @@ class TcpServer:
     def serverClose(self):
         self.socket.close()
 
+# Message Handler class. Responsible for processing the client message
 class MessageHandler:
     def __init__(self):return
 
+# Main thread handles shutdown and inturrupt signals along with updating client socket list
 def main():
-	signal.signal(signal.SIGINT, signal_handler)
-	signal.signal(signal.SIGTERM, signal_handler)
-	while(True):
-		serverSock.serverAccept()
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    while(True):
+        serverSock.serverAccept()
 
+# Read arguments 
 def parser():
-	# Parser to read the arguments
-	parser = argparse.ArgumentParser()
-	parser.add_argument('-sp', '--server_port', type=int,  required='True', help="Server Port to Bind")
+    # Parser to read the arguments
+    parser = argparse.ArgumentParser()
+    parser.add_argument('-sp', '--server_port', type=int,  required='True', help="Server Port to Bind")
 
-	# Parse the arguments and check for validity
-	args = parser.parse_args()
-	if args.server_port and args.server_port > 65535:sys.exit(1)
+    # Parse the arguments and check for validity
+    args = parser.parse_args()
+    if args.server_port and args.server_port > 65535:sys.exit(1)
 
-	serverAddress = ('',args.server_port)
-	return serverAddress
+    serverAddress = ('',args.server_port)
+    return serverAddress
 
+# Program start
 if __name__ == "__main__":
-	serverAddress = parser()
-	serverSock = TcpServer(serverAddress, MessageHandler)
-	rThread = receiverThread(1, "Thread-1", clientSockList)
-	rThread.start()
-	main()
-	cleanup()
+    serverAddress = parser()
+    serverSock = TcpServer(serverAddress, MessageHandler)
+    rThread = receiverThread(1, "Thread-1", clientSockList)
+    rThread.start()
+    main()
+    cleanup()
