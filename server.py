@@ -16,73 +16,71 @@ shutdown = 0
 
 # Signal handler to cath Interrupts
 def signal_handler (signal, frame):
-	print "Interrupt Received Cleaning Up..."
-	cleanup()
-	print "Exiting Main Thread"
-	sys.exit(0)
+    print "Interrupt Received Cleaning Up..."
+    cleanup()
+    print "Exiting Main Thread"
+    sys.exit(0)
 
 def cleanup():
-	rThread.shutdown()
-	rThread.join()
-	serverSock.serverClose()
-	print "Shutting down server..."
+    rThread.shutdown()
+    rThread.join()
+    serverSock.serverClose()
+    print "Shutting down server..."
 
 class receiverThread(threading.Thread):
+    def __init__(self, threadId, name, clientSockList):
+        threading.Thread.__init__(self)
+        self.threadId = threadId
+        self.name = name
+        self.clientSockList = clientSockList
+        self._is_shutdown = threading.Event()
+        self._shutdown_request = False
 
-	def __init__(self, threadId, name, clientSockList):
-		threading.Thread.__init__(self)
-		self.threadId = threadId
-		self.name = name
-		self.clientSockList = clientSockList
-		self._is_shutdown = threading.Event()
-		self._shutdown_request = False
+    def run(self):
+        print "Starting Receiver " + self.name
+        try:
+            while not self._shutdown_request:
+                print self.clientSockList
+                receiveMessage()
+        finally:
+            self._shutdown_request = False
+            self._is_shutdown.set()
+        print "Exited Receiver " + self.name
 
-	def run(self):
-		print "Starting Receiver " + self.name
-		try:
-			while not self._shutdown_request:
-				print self.clientSockList
-				receiveMessage()
-		finally:
-			self._shutdown_request = False
-			self._is_shutdown.set()
-
-		print "Exited Receiver " + self.name
-
-	def shutdown(self):
-		self._shutdown_request = True
-		self._is_shutdown.wait()
+    def shutdown(self):
+        self._shutdown_request = True
+        self._is_shutdown.wait()
 
 def receiveMessage():
-	pollTimeout = 2#Just for testing purpose
-	rList, wList, eList = select.select(clientSockList, outputSockList, clientSockList, pollTimeout)
-	for s in rList:
-		data = s.recv(1024)
-		if data:
-			messageQueues[s].put(data)
-			if s not in outputSockList:
-				outputSockList.append(s)
-		else:
-			if s in outputSockList:
-				outputSockList.remove(s)
-			clientSockList.remove(s)
-			s.close()
-			del messageQueues[s]
+    pollTimeout = 2#Just for testing purpose
+    rList, wList, eList = select.select(clientSockList, outputSockList, clientSockList, pollTimeout)
+    for s in rList:
+        data = s.recv(1024)
+        if data:
+            messageQueues[s].put(data)
+            if s not in outputSockList:
+                outputSockList.append(s)
+        else:
+            if s in outputSockList:
+                outputSockList.remove(s)
+            clientSockList.remove(s)
+            s.close()
+            del messageQueues[s]
 
-	for s in wList:
-		try:
-			nextMsg = messageQueues[s].get_nowait()
-		except Queue.Empty:
-			outputSockList.remove(s)
-		else:
-			s.send(nextMsg)
+    for s in wList:
+        try:
+            nextMsg = messageQueues[s].get_nowait()
+        except Queue.Empty:
+            outputSockList.remove(s)
+        else:
+            s.send(nextMsg)
 
-	for s in eList:
-		clientSockList.remove(s)
-		if s in outputSockList:
-			outputSockList.remove(s)
-		s.close()
-		del messageQueues[s]
+    for s in eList:
+        clientSockList.remove(s)
+        if s in outputSockList:
+            outputSockList.remove(s)
+        s.close()
+        del messageQueues[s]
 
 class TcpServer:
 
