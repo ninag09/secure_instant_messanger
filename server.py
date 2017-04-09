@@ -7,8 +7,11 @@ import threading
 import argparse
 import time
 import signal
+import Queue
 
 clientSockList = []
+outputSockList = []
+messageQueues = {}
 shutdown = 0
 
 # Signal handler to cath Interrupts
@@ -23,14 +26,14 @@ def cleanup():
 	rThread.join()
 	serverSock.serverClose()
 	print "Shutting down server..."
-	
+
 class receiverThread(threading.Thread):
 
-	def __init__(self, threadId, name, socketMap):
+	def __init__(self, threadId, name, clientSockList):
 		threading.Thread.__init__(self)
 		self.threadId = threadId
 		self.name = name
-		self.socketMap = socketMap
+		self.clientSockList = clientSockList
 		self._is_shutdown = threading.Event()
 		self._shutdown_request = False
 
@@ -38,6 +41,7 @@ class receiverThread(threading.Thread):
 		print "Starting Receiver " + self.name
 		try:
 			while not self._shutdown_request:
+				print self.clientSockList
 				receiveMessage()
 		finally:
 			self._shutdown_request = False
@@ -50,7 +54,35 @@ class receiverThread(threading.Thread):
 		self._is_shutdown.wait()
 
 def receiveMessage():
-		time.sleep(2)
+	pollTimeout = 2#Just for testing purpose
+	rList, wList, eList = select.select(clientSockList, outputSockList, clientSockList, pollTimeout)
+	for s in rList:
+		data = s.recv(1024)
+		if data:
+			messageQueues[s].put(data)
+			if s not in outputSockList:
+				outputSockList.append(s)
+		else:
+			if s in outputSockList:
+				outputSockList.remove(s)
+			clientSockList.remove(s)
+			s.close()
+			del messageQueues[s]
+
+	for s in wList:
+		try:
+			nextMsg = messageQueues[s].get_nowait()
+		except Queue.Empty:
+			outputSockList.remove(s)
+		else:
+			s.send(nextMsg)
+
+	for s in eList:
+		clientSockList.remove(s)
+		if s in outputSockList:
+			outputSockList.remove(s)
+		s.close()
+		del messageQueues[s]
 
 class TcpServer:
 
@@ -75,8 +107,10 @@ class TcpServer:
 
     def serverAccept(self):
         conn, addr = self.socket.accept()
+        conn.setblocking(0)
         clientSockList.append(conn)
-        
+        messageQueues[conn] = Queue.Queue()
+
     def serverClose(self):
         self.socket.close()
 
