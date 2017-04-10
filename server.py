@@ -22,6 +22,36 @@ clientSockList = []
 outputSockList = []
 messageQueues = {}
 cookieMap = {}
+workerQueue = Queue.Queue()
+queueLock = threading.Lock()
+
+class workerThread(threading.Thread):
+
+    def __init__(self, threadId, name):
+        threading.Thread.__init__(self)
+        self.threadId = threadId
+        self.name = name
+        self._is_shutdown = threading.Event()
+
+    def run(self):
+        try:
+            while(True):
+                if not processMessage(): break
+                print self.name
+        finally:
+            self._is_shutdown.set()
+
+    def shutdown(self):
+        workerQueue.put(None)
+        self._is_shutdown.wait()
+
+def processMessage():
+    queueLock.acquire()
+    data = workerQueue.get()
+    queueLock.release()
+    if not data: return False
+    MessageHandler(data[0],data[1])
+    return True
 
 # Receiver Thread class inherited from threading class
 # Responsible for send/recv client messages
@@ -64,9 +94,11 @@ def receiveMessage():
     for s in rList:
         data = s.recv(1024)
         if data:
-            processData(s, data) #!TODO must remove temporary verification
+            #processData(s, data) #!TODO must remove temporary verification
             #messageQueues[s].put(data)
             #!TODO should write into queue after processing data possibly from worker thread
+            msg = (s, data)
+            workerQueue.put(msg)
             if s not in outputSockList:
                 outputSockList.append(s)
         else:
@@ -171,7 +203,22 @@ def processData(conn, data):
 
 # Message Handler class. Responsible for processing the client message
 class MessageHandler:
-    def __init__(self):return
+
+    def __init__(self, client, request):
+        self.client = client
+        self.request = request
+        self.setup()
+        try:
+            self.processRequest()
+        finally:
+            self.sendResponse()
+
+    def setup(self):pass
+
+    def processRequest(self):
+        print self.request #!TODO Testing
+
+    def sendResponse(self):pass
 
 # Signal handler for SIGTERM and SIGINT
 def signal_handler (signal, frame):
@@ -183,6 +230,8 @@ def signal_handler (signal, frame):
 def cleanup():
     rThread.shutdown()
     rThread.join()
+    wThread.shutdown()
+    wThread.join()
     serverSock.serverClose()
     print "Shutting down server..."
 
@@ -217,6 +266,8 @@ if __name__ == "__main__":
     serverAddress = parser()
     serverSock = TcpServer(serverAddress, MessageHandler)
     rThread = receiverThread(1, "Thread-1", clientSockList)
+    wThread = workerThread(2, "Worker 1")
+    wThread.start()
     rThread.start()
     main()
     cleanup()
