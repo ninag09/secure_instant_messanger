@@ -1,0 +1,9 @@
+#!/bin/bash
+# pass port number as argument
+# usage : bash start_server 2000
+if [[ $1 = "-h" || -z "$*" ]];
+then
+  python server.py -h
+else
+  python server.py -sp $1
+fi

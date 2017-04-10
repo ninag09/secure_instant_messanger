@@ -9,27 +9,23 @@ import time
 import signal
 import Queue
 
+# Global varibles
+# clientSockList -> Active client connections
+# outputSockList -> Pending connections awaiting reply
+# messageQueues  -> Queues for active client connections
 clientSockList = []
 outputSockList = []
 messageQueues = {}
-shutdown = 0
 
-# Signal handler to cath Interrupts
-def signal_handler (signal, frame):
-    print "Interrupt Received Cleaning Up..."
-    cleanup()
-    print "Exiting Main Thread"
-    sys.exit(0)
-
-# CleanUp before exiting. Wait for threads to finish jobs and close socket
-def cleanup():
-    rThread.shutdown()
-    rThread.join()
-    serverSock.serverClose()
-    print "Shutting down server..."
-
-# Receiver Thread class. Responsible for send/recv client messages
+# Receiver Thread class inherited from threading class
+# Responsible for send/recv client messages
+# _is_shutdown      -> Threading event flag used to block thread during
+#                      shutdown do handle existing jobs before exiting
+# _shutdown_request -> Flag used to exit while loop during shutdown
+# run()             -> function invoked by thread.start()
+# shutdown()        -> function for handling shutdown flags
 class receiverThread(threading.Thread):
+
     def __init__(self, threadId, name, clientSockList):
         threading.Thread.__init__(self)
         self.threadId = threadId
@@ -39,24 +35,26 @@ class receiverThread(threading.Thread):
         self._shutdown_request = False
 
     def run(self):
-        print "Starting Receiver " + self.name
         try:
             while not self._shutdown_request:
-                print self.clientSockList
                 receiveMessage()
         finally:
             self._shutdown_request = False
             self._is_shutdown.set()
-        print "Exited Receiver " + self.name
 
     def shutdown(self):
         self._shutdown_request = True
         self._is_shutdown.wait()
 
-# Polling for messages and adding it to the message queue
+# Receive Message function will poll for messages
+# and read/write into respective message queues
+# Called from receiver thread run() function
+# rList, wList, eList -> socket objects for reading,
+#                        writing, and error handling
 def receiveMessage():
-    pollTimeout = 2#Just for testing purpose
+    pollTimeout = 2 #Just for testing purpose
     rList, wList, eList = select.select(clientSockList, outputSockList, clientSockList, pollTimeout)
+
     for s in rList:
         data = s.recv(1024)
         if data:
@@ -67,6 +65,7 @@ def receiveMessage():
             if s in outputSockList:
                 outputSockList.remove(s)
             clientSockList.remove(s)
+            print "Client removed,", len(clientSockList), "active clients"
             s.close()
             del messageQueues[s]
 
@@ -80,12 +79,21 @@ def receiveMessage():
 
     for s in eList:
         clientSockList.remove(s)
+        print "Client removed,", len(clientSockList), "active clients"
         if s in outputSockList:
             outputSockList.remove(s)
         s.close()
         del messageQueues[s]
 
-# Tcp Server class. Responsible for listening and accepting client connections
+# Tcp Server class, Responsible for listening and accepting client connections
+# serverAddress    -> address received from commandline arguments
+# MessageHandler   -> class that processes the request
+# serverBind()     -> bind the address to the socket
+# SO_REUSEADDR     -> flag to re-use same address when socket in TIME_WAIT state
+# serverActivate() -> start listening for client connections
+# serverAccept()   -> accept incoming client connections
+# setblocking(0)   -> make socket non-blocking for asynchronous message handling
+# serverClose()    -> close the server socket
 class TcpServer:
 
     def __init__(self, serverAddress, MessageHandler):
@@ -108,10 +116,14 @@ class TcpServer:
         self.socket.listen(5)
 
     def serverAccept(self):
-        conn, addr = self.socket.accept()
+        try:
+            conn, addr = self.socket.accept()
+        except socket.error:
+            return
         conn.setblocking(0)
         clientSockList.append(conn)
         messageQueues[conn] = Queue.Queue()
+        print "New client added,", len(clientSockList), "active clients"
 
     def serverClose(self):
         self.socket.close()
@@ -120,14 +132,20 @@ class TcpServer:
 class MessageHandler:
     def __init__(self):return
 
-# Main thread handles shutdown and inturrupt signals along with updating client socket list
-def main():
-    signal.signal(signal.SIGINT, signal_handler)
-    signal.signal(signal.SIGTERM, signal_handler)
-    while(True):
-        serverSock.serverAccept()
+# Signal handler for SIGTERM and SIGINT
+def signal_handler (signal, frame):
+    print "Signal Received for Shutdown, Cleaning Up..."
+    cleanup()
+    sys.exit(0)
 
-# Read arguments 
+# CleanUp before exiting. Wait for threads to finish jobs and close socket
+def cleanup():
+    rThread.shutdown()
+    rThread.join()
+    serverSock.serverClose()
+    print "Shutting down server..."
+
+# Read arguments
 def parser():
     # Parser to read the arguments
     parser = argparse.ArgumentParser()
@@ -135,12 +153,25 @@ def parser():
 
     # Parse the arguments and check for validity
     args = parser.parse_args()
-    if args.server_port and args.server_port > 65535:sys.exit(1)
+    if args.server_port < 0 or args.server_port > 65535:
+        print "Invalid Port..."
+        sys.exit(1)
 
     serverAddress = ('',args.server_port)
     return serverAddress
 
+# Main thread handles shutdown and inturrupt signals along with accepting
+# client connections and updating client socket list
+def main():
+    signal.signal(signal.SIGINT, signal_handler)
+    signal.signal(signal.SIGTERM, signal_handler)
+    print "Server started, waiting for clients.."
+    while(True):
+        serverSock.serverAccept()
+
 # Program start
+# serverSock -> TcpServer object
+# rThread    -> Receiver Thread object
 if __name__ == "__main__":
     serverAddress = parser()
     serverSock = TcpServer(serverAddress, MessageHandler)

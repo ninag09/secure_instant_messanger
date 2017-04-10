@@ -1,2 +1,0 @@
-#!/bin/bash
-kill $(ps | awk '{if($6=="-sp") print $1}')
