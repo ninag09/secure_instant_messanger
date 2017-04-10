@@ -8,14 +8,20 @@ import argparse
 import time
 import signal
 import Queue
+import random
+
+from cryptography.hazmat.backends import default_backend
+from cryptography.hazmat.primitives import hashes
 
 # Global varibles
 # clientSockList -> Active client connections
 # outputSockList -> Pending connections awaiting reply
 # messageQueues  -> Queues for active client connections
+# cookieMap      -> secret challenge bits of client cookie
 clientSockList = []
 outputSockList = []
 messageQueues = {}
+cookieMap = {}
 
 # Receiver Thread class inherited from threading class
 # Responsible for send/recv client messages
@@ -58,7 +64,9 @@ def receiveMessage():
     for s in rList:
         data = s.recv(1024)
         if data:
-            messageQueues[s].put(data)
+            processData(s, data) #!TODO must remove temporary verification
+            #messageQueues[s].put(data)
+            #!TODO should write into queue after processing data possibly from worker thread
             if s not in outputSockList:
                 outputSockList.append(s)
         else:
@@ -118,6 +126,7 @@ class TcpServer:
     def serverAccept(self):
         try:
             conn, addr = self.socket.accept()
+            conn.send(challengeCookie(addr).cookie)
         except socket.error:
             return
         conn.setblocking(0)
@@ -127,6 +136,38 @@ class TcpServer:
 
     def serverClose(self):
         self.socket.close()
+
+# Challenge Cookie class
+# Responsible for generating challenge cookie
+# 128 bit cookie hash along with 118 bit cookie is sent while
+# accepting connection, last 10 bits of cookie has to be
+# calculated by client through brute force thus reducing DOS attacks
+class challengeCookie:
+
+    def __init__(self, clientAddress):
+        self.clientAddress = clientAddress
+        self.cookie = self.generateCookie()
+
+    def generateCookie(self):
+        bits = bin(random.getrandbits(128))
+        bits128 = str(bits[2:130]).rjust(128,'1')
+        challenge = bits128 + self.clientAddress[0]
+        digest = hashes.Hash(hashes.SHA256(), backend=default_backend())
+        digest.update(challenge)
+        clientBits, secretBits = bits128[0:118], bits128[118:128]
+        cookieMap[self.clientAddress] = secretBits
+        return clientBits + '<<>>' + digest.finalize()
+
+# Verify last 10 bits of challenge sent while accepting connection
+def verifyCookie(clientConn, cookieResponse):
+    return cookieResponse == cookieMap[clientConn.getpeername()]
+
+#!TODO temoporary verification function remove afterwards
+def processData(conn, data):
+    if(verifyCookie(conn, data[0:10])):
+        print "Client Verified"
+        return
+    print "Intruder, Closing connection from", conn.getpeername()
 
 # Message Handler class. Responsible for processing the client message
 class MessageHandler:

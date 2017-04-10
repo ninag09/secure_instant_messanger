@@ -1,5 +1,11 @@
 #!/bin/bash
 # usage:  bash stop_server
 x=$(ps -ea | awk '{if($6=="-sp") print $1}')
-if [ $x ]; then kill $x
+if [ $x ];then
+  if [ -z "$*" ];
+  then
+    kill $x
+  else
+    kill -9 $x
+  fi
 fi
