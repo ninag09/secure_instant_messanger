@@ -29,8 +29,11 @@ from cryptography.hazmat.primitives.ciphers import (Cipher, algorithms, modes)
 # Global varibles
 # clientSockList -> Active client connections
 # outputSockList -> Pending connections awaiting reply
+# activeUserlist -> active username list
 # clientConnMap  -> Map storing client connection objects
-# cookieMap      -> secret challenge bits of client cookie
+# userConnMap    -> Map with username as key
+# workerQueue    -> Queue that can be shared between worker threads
+#                   free worker threads can pick up message and process
 userConnMap = {}
 clientConnMap = {}
 clientSockList = []
@@ -39,6 +42,10 @@ activeUserlist = []
 workerQueue = Queue.Queue()
 queueLock = threading.Lock()
 
+# class clientConn
+# Responsible for storing client details
+# An object is created for each client connection
+# and it is deleted when the connection with that user is terminated
 class clientConn:
     def __init__(self, sock, messageQueue=None, cookie=None, userName=None,
                 key=None, publicKey=None, clientIpPort=None):
@@ -49,6 +56,7 @@ class clientConn:
         self.key = key
         self.publicKey = publicKey
         self.clientIpPort = clientIpPort
+        self.authenticated = False
 
     def printValues(self, detailed=False):
         print "Connection From IP :", self.sockObj.getpeername()[0], ', Port :', self.sockObj.getpeername()[1]
@@ -58,6 +66,9 @@ class clientConn:
         print "Secret cookie :", self.cookie
         print "User Public Key :", self.publicKey
 
+# class workerThread
+# Responsible for processing the clients messages
+# Worker threads are implemented to support scalability
 class workerThread(threading.Thread):
 
     def __init__(self, threadId, name):
@@ -119,7 +130,7 @@ class receiverThread(threading.Thread):
 # rList, wList, eList -> socket objects for reading,
 #                        writing, and error handling
 def receiveMessage():
-    pollTimeout = 0.2 #Just for testing purpose
+    pollTimeout = 0.1
     rList, wList, eList = select.select(clientSockList, outputSockList, clientSockList, pollTimeout)
 
     for s in rList:
@@ -134,10 +145,11 @@ def receiveMessage():
                 outputSockList.remove(s)
             clientSockList.remove(s)
             if clientConnMap[s].userName in activeUserlist:
+                if clientConnMap[s].authenticated:
+                    print clientConnMap[s].userName, "logged out,", len(clientSockList), "active clients"
                 activeUserlist.remove(clientConnMap[s].userName)
                 del userConnMap[clientConnMap[s].userName]
             s.close()
-            print "Client removed,", len(clientSockList), "active clients"
             del clientConnMap[s]
 
     for s in wList:
@@ -199,7 +211,6 @@ class TcpServer:
         clientConnMap[conn] = clientConn(conn)
         clientConnMap[conn].messageQueue = Queue.Queue()
         conn.send(challengeCookie(addr,conn).cookie)
-        print "New client added,", len(clientSockList), "active clients"
 
     def serverClose(self):
         self.socket.close()
@@ -242,7 +253,6 @@ def RSAEncryption(client_public_key, symmetricKey):
                 algorithm=hashes.SHA1(),label=None))
     except:
         print "encryption failed!!"
-        raise
 
 # RSA Decrytion to decrypt the keys
 def RSADecryption(cipherKey):
@@ -251,17 +261,15 @@ def RSADecryption(cipherKey):
                      algorithm=hashes.SHA1(),label=None))
 
 # Encrypting the text using AES algorithm
-def encryptDataWithAESGCM(symmetricKey, data, authenticationString):
+def encryptDataWithAESGCM(symmetricKey, data):
     iv = os.urandom(32)
     encryptor = Cipher(algorithms.AES(symmetricKey),modes.GCM(iv),backend=default_backend()).encryptor()
-    encryptor.authenticate_additional_data(authenticationString)
     ciphertext = encryptor.update(data) + encryptor.finalize()
     return (iv, ciphertext, encryptor.tag)
 
 # Decrypt the data with AES and GCM algorithm
-def decryptDataWithAES(decryptedKey,authenticationString,iv,cipherText,encryptorTag):
+def decryptDataWithAES(decryptedKey,iv,cipherText,encryptorTag):
     decryptor = Cipher(algorithms.AES(decryptedKey),modes.GCM(iv, encryptorTag),backend=default_backend()).decryptor()
-    decryptor.authenticate_additional_data(authenticationString)
     return decryptor.update(cipherText) + decryptor.finalize()
 
 #verify client password hash with server DB hash
@@ -273,12 +281,11 @@ def verifyHashSaltPassword(password, userName):
             for line in lines:
                 line = line.rstrip('\n')
                 if re.match(userName, line):
-                    user, salt, hashValue = line.split(':', 2)
+                    user, salt, hashValue = line.split('<<>>', 2)
     except:
         print "Error in accessing the Password file"
         return False
-    return True
-    #return password == hashValue
+    return password == hashValue
 
 #verifyTimeStamp with client time stamp and if difference is more than a minute drop the message
 def verifyTimeStamp(clientTimeStamp):
@@ -297,14 +304,16 @@ def verifyTimeStamp(clientTimeStamp):
 def generateCurrentTime():
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
+# Obtain Symmetric Key from cipherKey
 def obtainSymmKey(request):
-    cipherKey = request.split('<<>>')[4]
+    cipherKey = request.split('<<>>')[3]
     return RSADecryption(cipherKey)
 
+# Decrypt Data using AES
 def decryptData(client, request):
     parts = request.split('<<>>')
-    iv, cipherText, encryptorTag, authenticationString = parts[0], parts[1], parts[2], parts[3]
-    return decryptDataWithAES(clientConnMap[client].key,authenticationString,iv,cipherText,encryptorTag)
+    iv, cipherText, encryptorTag = parts[0], parts[1], parts[2]
+    return decryptDataWithAES(clientConnMap[client].key, iv,cipherText,encryptorTag)
 
 # Message Handler class. Responsible for processing the client message
 class MessageHandler:
@@ -316,7 +325,6 @@ class MessageHandler:
             self.setup()
         except:
             print "Invalid Message"
-            raise
             return
         self.processRequest()
 
@@ -340,7 +348,6 @@ class MessageHandler:
 
         elif msgType == 'LOGIN2':
             if not processLoginMsg2(self, data):
-                #self.client.close()
                 return
             self.encryptData()
             cipherKey = RSAEncryption(clientConnMap[self.client].publicKey, clientConnMap[self.client].key)
@@ -352,9 +359,11 @@ class MessageHandler:
             if not verifyTimeStamp(self.clientTS):
                 print "Found Replay attack, Dropping packet from", self.getpeername()
                 return
-            self.dataToBeSentToClient = "You are now logged In!!"
+            self.data = "You are now logged In!!"
+            self.encryptData()
             self.sendResponse()
             clientConnMap[self.client].printValues()
+            print
 
         elif msgType == "LIST":
             self.clientTS, user = data[1], data[2]
@@ -373,16 +382,17 @@ class MessageHandler:
             self.sendResponse()
 
     def encryptData(self):
-        authString = b"ChatApp"
-        iv, cipherText, encryptorTag = encryptDataWithAESGCM(clientConnMap[self.client].key, self.data, authString)
-        self.dataToBeSentToClient = iv + '<<>>' + cipherText + '<<>>' + encryptorTag + '<<>>' + authString
+        iv, cipherText, encryptorTag = encryptDataWithAESGCM(clientConnMap[self.client].key, self.data)
+        self.dataToBeSentToClient = iv + '<<>>' + cipherText + '<<>>' + encryptorTag
 
     def sendResponse(self):
         outputSockList.append(self.client)
         clientConnMap[self.client].messageQueue.put(self.dataToBeSentToClient)
 
+# Fucntion to process login message
 def processLoginMsg1(msgObj, data):
     chalResp, userName, msgObj.clientTS = data[1], data[2], data[3]
+    userNotFound = False
     if not verifyTimeStamp(msgObj.clientTS):
         print "Found Replay attack, Dropping packet from", msgObj.getpeername()
         return False
@@ -396,14 +406,25 @@ def processLoginMsg1(msgObj, data):
             for line in lines:
                 line = line.rstrip('\n')
                 if re.match(userName, line):
-                    msgObj.user, msgObj.salt, msgObj.hashValue = line.split(':', 2)
-                #else:
-                #    return False
-                    #!TODO handle user not found scenarios
+                    try:
+                        msgObj.user, msgObj.salt, msgObj.hashValue = line.split('<<>>', 2)
+                    except:
+                        userNotFound = True
+                        break
+                    userNotFound = False
+                    break
+                else:
+                    userNotFound = True
     except:
         print "Error in accessing the Password file"
         return False
-    clientConnMap[msgObj.client].userName = userName #!TODO Multiple logins case shud be handled
+    if userNotFound:
+        msgObj.data = pickle.dumps(('LOGIN1', False, False))
+        return True
+    if userName in activeUserlist:
+        msgObj.data = pickle.dumps(('LOGIN1', False, True))
+        return True
+    clientConnMap[msgObj.client].userName = userName
     activeUserlist.append(userName)
     userConnMap[userName] = msgObj.client
     serverTimeStampToClient = generateCurrentTime()
@@ -411,16 +432,17 @@ def processLoginMsg1(msgObj, data):
     msgObj.data = pickle.dumps(dataToSend)
     return True
 
+# Function to process second login message
 def processLoginMsg2(msgObj, data):
     password, userName, msgObj.clientTS, clientConnMap[msgObj.client].publicKey = data[1], data[2], data[3], data[4]
     if not verifyTimeStamp(msgObj.clientTS):
         print "Found Replay attack, Dropping packet from", msgObj.getpeername()
         return False
     if not verifyHashSaltPassword(password, userName):
-        msgObj.dataToBeSentToClient = "LOGIN FAILED"
-        msgObj.sendResponse()
-        return False
+        msgObj.data = pickle.dumps(('LOGIN2', False))
+        return True
     print 'New user', userName, 'authenticated!!'
+    clientConnMap[msgObj.client].authenticated = True
     #destroy old symmetri key we used for previous messages and generate new shared key
     clientConnMap[msgObj.client].key = os.urandom(32) #AES 256
     serverTimeStampToClient = generateCurrentTime()
@@ -428,6 +450,7 @@ def processLoginMsg2(msgObj, data):
     msgObj.data = pickle.dumps(dataToSend)
     return True
 
+# Fucntion to process SEND message
 def processSendMsg(msgObj, data):
     msgObj.clientTS, senderUserName, peerClientUserName = data[1], data[2], data[3]
     if not verifyTimeStamp(msgObj.clientTS):
@@ -442,9 +465,8 @@ def processSendMsg(msgObj, data):
                   clientConnMap[msgObj.client].publicKey, clientConnMap[msgObj.client].clientIpPort)
     data = pickle.dumps(dataToSend)
 
-    authenticationString = b"ChatApp"
-    iv, cipherText, encryptorTag = encryptDataWithAESGCM(clientConnMap[peerClient].key, data, authenticationString)
-    ticket = iv + '<<>>' + cipherText + '<<>>' + encryptorTag + '<<>>' + authenticationString
+    iv, cipherText, encryptorTag = encryptDataWithAESGCM(clientConnMap[peerClient].key, data)
+    ticket = iv + '<<>>' + cipherText + '<<>>' + encryptorTag
 
     serverTimeStampToClient = generateCurrentTime()
     dataToSend = ('SEND', True, serverTimeStampToClient, peerClientTimeStamp, senderUserName,
@@ -456,6 +478,7 @@ def processSendMsg(msgObj, data):
 
 # Signal handler for SIGTERM and SIGINT
 def signal_handler (signal, frame):
+    print
     print "Signal Received for Shutdown, Cleaning Up..."
     cleanup()
 
@@ -516,6 +539,7 @@ def main():
 # Program start
 # serverSock -> TcpServer object
 # rThread    -> Receiver Thread object
+# wThread    -> Worker Thread object
 if __name__ == "__main__":
     serverAddress = parser()
     serverSock = TcpServer(serverAddress)

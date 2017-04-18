@@ -1,5 +1,6 @@
 #!/usr/bin/python
 import os
+import re
 import sys
 import time
 import socket
@@ -25,30 +26,40 @@ from cryptography.hazmat.primitives.serialization import load_pem_public_key
 from cryptography.hazmat.primitives.ciphers import (Cipher, algorithms, modes)
 from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
 
+#sockList -> list of active sockets
+#peerSockMap -> peer connection sock objects
+#peerKeyMap -> peer symmetricKey
 sockList = []
 peerSockMap = {}
 peerKeyMap = {}
-peerKeyAccMap = {}
-firstMsg = ''
 
-# Read Arguments
+# Read config file for Server IP and Port
 def parser():
-    # Parser to read the arguments
-    parser = argparse.ArgumentParser()
-    parser.add_argument('-sip', '--server_ip', required='True', help="Enter Server IP")
-    parser.add_argument('-sp', '--server_port', type=int, required='True', help="Server Port to Bind")
-
-    # Parse the arguments, check for validity and form sign-in message
-    args = parser.parse_args()
     try:
-        socket.inet_pton(socket.AF_INET,args.server_ip)
+        configFile = open("Config.conf", "rb")
+        with configFile as configFromFile:
+            lines = configFromFile.readlines()
+            for line in lines:
+                line = line.rstrip('\n')
+                if re.match('SERVER_IP', line):
+                    serverIP = line.split('=', 1)
+                elif re.match('SERVER_PORT', line):
+                    serverPort = line.split('=', 1)
+    except:
+        print "Error in accessing the Config file"
+        return False
+
+    server_ip = serverIP[1]
+    server_port = int(serverPort[1])
+    try:
+        socket.inet_aton(server_ip)
     except socket.error:
         print "Invalid IP Address"
         sys.exit(1)
-    if args.server_port < 0 and args.server_port > 65535:
+    if server_port < 0 and server_port > 65535:
         print "Invalid Port... Port Range [0-65535]"
         sys.exit(1)
-    return (args.server_ip, args.server_port)
+    return (server_ip, server_port)
 
 # Signal handler for SIGTERM and SIGINT
 def signal_handler (signal, frame):
@@ -89,7 +100,7 @@ class receiverThread(threading.Thread):
 # rList, wList, eList -> socket objects for reading,
 #                        writing, and error handling
 def receiveMessage():
-    pollTimeout = 0.2 #Just for testing purpose
+    pollTimeout = 0.1
     rList, wList, eList = select.select(sockList, [], sockList, pollTimeout)
 
     for s in rList:
@@ -108,6 +119,10 @@ def receiveMessage():
         else:
             if s == server.socket:
                 flush("Connection terminated with server..."+'\n'+"+> ")
+            if s in peerKeyMap.keys():
+                flush(peerKeyMap[s][1]+" logged out"+'\n'+"+> ")
+                del peerSockMap[peerKeyMap[s][1]]
+                del peerKeyMap[s]
             sockList.remove(s)
             s.close()
 
@@ -115,26 +130,50 @@ def receiveMessage():
         sockList.remove(s)
         s.close()
 
+#Process Peer Messages
 def processPeerMessage(sock, data):
-    decryptedData = decryptDataWithAES(data, peerKeyAccMap[sock][0])
-    msg = pickle.loads(decryptedData)
+    try:
+        decryptedData = decryptDataWithAES(data, peerKeyMap[sock][0])
+        msg = pickle.loads(decryptedData)
+    except:
+        print "Invalid Message"
+        return
+    timestamp, msg, hashMessage, username = msg[0], msg[1], msg[2], msg[3]
+    if not verifyTimeStamp(timestamp):
+        print 'Found Replay attack, Dropping the packet!!'
+        return
+    digest = hashes.Hash(hashes.SHA256(), backend=default_backend())
+    digest.update(msg)
+    hashOriginalMsg = digest.finalize()
+    if (hashOriginalMsg != hashMessage):
+        print "Message has been modified, Dropping the packet!!"
+        return
     addr = sock.getpeername()
-    flush('<- < From '+str(addr[0])+':'+str(addr[1])+': '+peerKeyAccMap[sock][1]+' >: ')
-    for i in range (0,len(msg)): print msg[i],
-    flush('+> ')
+    flush('<- < From '+str(addr[0])+':'+str(addr[1])+': '+peerKeyMap[sock][1]+' >: ')
+    print msg
+    flush('+> ',False)
 
+# Handle ticket (originated from server) sent by client trying to establish connection
 def handleTicketMsg(sock):
-    recvMsg = sock.recv(4096)
-    decryptedData = decryptDataWithAES(recvMsg, server.symmKey)
-    data = pickle.loads(decryptedData)
+    try:
+        recvMsg = sock.recv(4096)
+        decryptedData = decryptDataWithAES(recvMsg, server.symmKey)
+        data = pickle.loads(decryptedData)
+    except:
+        print "Invalid Message"
+        sock.close()
+        return False
     peerTimestamp, peerUsername = data[0], data[1]
     username, peerPublicKey, peerIpPort = data[2], data[3], data[4]
-    #!TODO verifyTimeStamp
+    if not verifyTimeStamp(peerTimestamp):
+        print 'Found Replay attack, Dropping packet and Closing connection!!'
+        sock.close()
+        return False
     timestampToPeer = generateCurrentTime()
     data = pickle.dumps((peerTimestamp, timestampToPeer, peerUsername, username))
-    authString = b"ChatApp"
     P2PSymmKey = os.urandom(32)
-    peerKeyAccMap[sock] = P2PSymmKey, peerUsername
+    peerKeyMap[sock] = P2PSymmKey, peerUsername
+    peerSockMap[peerUsername] = sock
     try:
         buf = StringIO.StringIO(peerPublicKey)
         peerPublicKey = serialization.load_pem_public_key(buf.read(), backend = default_backend())
@@ -143,43 +182,62 @@ def handleTicketMsg(sock):
                     algorithm=hashes.SHA1(),label=None))
         iv = os.urandom(32)
         encryptor = Cipher(algorithms.AES(P2PSymmKey),modes.GCM(iv),backend=default_backend()).encryptor()
-        encryptor.authenticate_additional_data(authString)
         ciphertext = encryptor.update(data) + encryptor.finalize()
         tag = encryptor.tag
     except:
         print "Error in Encryption, closing peer connection.."
         sock.close()
-    dataToBeSentToPeer = iv + '<<>>' + ciphertext + '<<>>' + tag + '<<>>' + authString + '<<>>' + cipherKey
+        return False
+    dataToBeSentToPeer = iv + '<<>>' + ciphertext + '<<>>' + tag + '<<>>' + cipherKey#+ authString + '<<>>' + cipherKey
     sock.send(dataToBeSentToPeer)
+    return True
 
+# Authenticate peer
 def handleTicketMsg1(sock):
     recvMsg = sock.socket.recv(4096)
-    cipherKey = recvMsg.split('<<>>')[4]
+    cipherKey = recvMsg.split('<<>>')[3]
     P2PSymmKey =  RSADecryption(cipherKey)
     sock.P2PSymmKey = P2PSymmKey
     decryptedData = decryptDataWithAES(recvMsg, sock.P2PSymmKey)
     data = pickle.loads(decryptedData)
     peerClientTimeStampToPeer, peerClientTimeStampFromPeer = data[0], data[1]
     username, peerUsername = data[2], data[3]
-    #!TODO verifyTimeStamp
+    if (peerClientTimeStamp != peerClientTimeStampToPeer) or not verifyTimeStamp(peerClientTimeStampFromPeer):
+        print 'Found Replay attack, Dropping packet!!'
+        return False
     peerClientTimeStampToPeer = generateCurrentTime()
-    data = pickle.dumps((peerClientTimeStampToPeer, firstMsg))
-    authString = b"ChatApp"
-    iv, cipherText, encryptorTag = encryptDataWithAESGCM(P2PSymmKey, data,authString)
-    dataToBeSentToPeerClient = iv + '<<>>' + cipherText + '<<>>' + encryptorTag + '<<>>' + authString
-    sock.socket.send(dataToBeSentToPeerClient)
+    digest = hashes.Hash(hashes.SHA256(), backend=default_backend())
+    digest.update(firstMsg)
+    hashMessage = digest.finalize()
+    data = pickle.dumps((peerClientTimeStampToPeer, firstMsg, hashMessage, username))
+    iv, cipherText, encryptorTag = encryptDataWithAESGCM(P2PSymmKey, data)
 
+    dataToBeSentToPeerClient = iv + '<<>>' + cipherText + '<<>>' + encryptorTag
+    sock.socket.send(dataToBeSentToPeerClient)
+    return True
+
+# Print the message recevied from authenticated peer
 def handleTicketMsg2(sock):
     recvMsg = sock.recv(4096)
-    decryptedData = decryptDataWithAES(recvMsg, peerKeyAccMap[sock][0])
+    decryptedData = decryptDataWithAES(recvMsg, peerKeyMap[sock][0])
     data = pickle.loads(decryptedData)
-    timestamp, msg = data[0], data[1]
-    #!TODO verifyTimeStamp
+    timestamp, msg, hashMessage, username = data[0], data[1], data[2], data[3]
+    if not verifyTimeStamp(timestamp):
+        print 'Found Replay attack, Dropping packet!!'
+        return False
+    digest = hashes.Hash(hashes.SHA256(), backend=default_backend())
+    digest.update(msg)
+    hashOriginalMsg = digest.finalize()
+    if (hashOriginalMsg != hashMessage):
+        print "Message has been modified, Dropping Packet!!"
+        return False
     addr = sock.getpeername()
-    flush('<- <From '+str(addr[0])+':'+str(addr[1])+':'+peerKeyAccMap[sock][1]+'>: ')
-    for i in range (0,len(msg)): print msg[i],
-    flush('+> ')
+    flush('<- < From '+str(addr[0])+':'+str(addr[1])+' : '+peerKeyMap[sock][1]+' >: ')
+    print msg
+    flush('+> ',False)
+    return True
 
+# Process the messages from server (List and Send)
 def processServerMessage(sock, data):
     decryptedData = decryptDataWithAES(data, server.symmKey)
     msg = pickle.loads(decryptedData)
@@ -189,23 +247,30 @@ def processServerMessage(sock, data):
     elif msgType == 'SEND':
         handleSendMsg(msg)
 
+# Handle send message reply from server
 def handleSendMsg(data):
     if not data[1]:
         flush('<- User not found')
         flush('+> ')
         return
+    global peerClientTimeStamp
     serverTimeStampToClient, peerClientTimeStamp, senderUserName = data[2], data[3], data[4]
-    #!TODO why peerClientPublicKey???
     peerUserName, peerClientPublicKey = data[5], data[6]
     peerIpPort, ticket = data[7], data[8]
-    #!TODO verifyTimeStamp
-    pConn = peerConn(peerIpPort, senderUserName, ticket)
-    peerSockMap[pConn.username] = pConn.socket
-    peerKeyMap[pConn.socket] = pConn.P2PSymmKey
+    if not verifyTimeStamp(serverTimeStampToClient):
+        print 'Found Replay attack, Dropping packet!!'
+        return
+    pConn = peerConn(peerIpPort, peerUserName, ticket)
+    if not pConn.peerAuthFailed:
+        peerSockMap[pConn.username] = pConn.socket
+        peerKeyMap[pConn.socket] = pConn.P2PSymmKey, pConn.username
 
+# Handle list message reply from server
 def handleListMsg(data):
     timestamp, activeUserlist = data[1], data[2]
-    #!TODO verifyTimeStamp
+    if not verifyTimeStamp(timestamp):
+        print 'Found Replay attack, Dropping packet!!'
+        return
     flush('<- Signed-In Users: ')
     for numOfUsers in range (0,len(activeUserlist)):
         if numOfUsers != len(activeUserlist)-1:
@@ -218,21 +283,26 @@ def flush(data=None, nextLine=True):
     if data: sys.stdout.write(data)
     sys.stdout.flush()
 
+# Class peerConn
+# This class initiates the new connection after it receives the ticket
+# from the server, after authentication the message is sent
 class peerConn:
-
     def __init__(self, peerAddress, username, ticket):
         self.peerAddress = peerAddress
         self.username = username
         self.socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.peerAuthFailed = False
         try:
             self.peerConnect()
         except:
             print "Couldn't connect to ", self.username
             self.peerClose()
         self.socket.send(ticket)
-        handleTicketMsg1(self)
-        self.socket.setblocking(0)
-        sockList.append(self.socket)
+        if handleTicketMsg1(self):
+            self.socket.setblocking(0)
+            sockList.append(self.socket)
+        else:
+            self.peerAuthFailed = True
 
     def peerConnect(self):
         self.socket.connect(self.peerAddress)
@@ -240,6 +310,9 @@ class peerConn:
     def peerClose(self):
         self.socket.close()
 
+# class clientsConn
+# This class is responsible for handling connection requests from other
+# peers it'll add the socket into sockList after authentication
 class clientsConn:
 
     def __init__(self):
@@ -267,14 +340,17 @@ class clientsConn:
             conn, addr = self.socket.accept()
         except socket.error:
             return
-        handleTicketMsg(conn)
-        handleTicketMsg2(conn)
-        conn.setblocking(0)
-        sockList.append(conn)
+        if handleTicketMsg(conn):
+            if handleTicketMsg2(conn):
+                conn.setblocking(0)
+                sockList.append(conn)
 
     def clientClose(self):
         self.socket.close()
 
+# class serverConn
+# This class is responsible for establishing connection with server and handles
+# Login, List and initial Send command
 class serverConn:
 
     def __init__(self, serverAddress):
@@ -296,9 +372,11 @@ class serverConn:
     def serverClose(self):
         self.socket.close()
 
+# Generate Current time for timestamp to mitigate replay attacks
 def generateCurrentTime():
     return datetime.now().strftime('%Y-%m-%d %H:%M:%S')
 
+# Verify the receiced timestamp
 def verifyTimeStamp(serverTimeStamp):
     fmt = '%Y-%m-%d %H:%M:%S'
     clientTimeStamp = datetime.now().strftime(fmt)
@@ -311,46 +389,72 @@ def verifyTimeStamp(serverTimeStamp):
         return False
     return True
 
+# Login function handles the initial login messages to server for mutual
+# authentication and terminates the client in case of any errors
 def login():
     username = raw_input("Username:")
     password = getpass.getpass("Password:")
     createLoginMsg1(username)
     createLoginMsg2(username, password)
     createLoginMsg3()
-    print getLoginResponse()
+    data = getLoginResponse()
+    print decryptDataWithAES(data, server.symmKey)
     sockList.append(server.socket)
     server.socket.setblocking(0)
     server.username = username
 
+# Initial login message responding with server's challenge
 def createLoginMsg1(username):
     timestamp = generateCurrentTime()
     data = pickle.dumps(('LOGIN1', server.challengeResponse, username, timestamp))
-    authString = b"ChatApp"
     server.symmKey = os.urandom(32)
-    iv, ciphertext, encryptorTag = encryptDataWithAESGCM(server.symmKey, data, authString)
+    iv, ciphertext, encryptorTag = encryptDataWithAESGCM(server.symmKey, data)
     cipherKey = RSAEncryption(server.symmKey)
-    dataToBeSentToServer = iv + '<<>>' + ciphertext + '<<>>' + encryptorTag + '<<>>' + authString + '<<>>' + cipherKey
+    dataToBeSentToServer = iv + '<<>>' + ciphertext + '<<>>' + encryptorTag + '<<>>' + cipherKey
     server.socket.send(dataToBeSentToServer)
 
+# Function to create second message from client which contains username and password
 def createLoginMsg2(username, password):
     data = getLoginResponse()
-    decryptedData = decryptDataWithAES(data, server.symmKey)
-    msg = pickle.loads(decryptedData)
+    try:
+        decryptedData = decryptDataWithAES(data, server.symmKey)
+        msg = pickle.loads(decryptedData)
+    except:
+        print "Invalid Message"
+        cleanup()
+    if not msg[1]:
+        if msg[2]:
+            print "You are already logged in!!!"
+            cleanup()
+        print 'username or password pair not found!!' + '\n'
+        cleanup()
     salt, timestamp, serverTimestamp = msg[0], msg[2], msg[3]
-    #! TODO add verifyTimeStamp
+    if not verifyTimeStamp(serverTimestamp):
+        print 'Found Replay attack, Dropping packet!!'
+        cleanup()
     passwdHash = saltedPasswordHash(password, salt)
     timestamp = generateCurrentTime()
     loginMsg2 = pickle.dumps(('LOGIN2', passwdHash, username, timestamp, asymKeys.publicKey))
     encryptSend(loginMsg2)
 
+# Function which accepts the new symmetricKey generated from server and acknowledge
 def createLoginMsg3():
     data = getLoginResponse()
-    cipherKey = data.split('<<>>')[4]
-    server.symmKey = RSADecryption(cipherKey)
-    decryptedData = decryptDataWithAES(data, server.symmKey)
-    msg = pickle.loads(decryptedData)
+    try:
+        cipherKey = data.split('<<>>')[3]
+        server.symmKey = RSADecryption(cipherKey)
+        decryptedData = decryptDataWithAES(data, server.symmKey)
+        msg = pickle.loads(decryptedData)
+    except:
+        print "Invalid Message"
+        cleanup()
+    if not msg[1]:
+        print "username or password pair not found!!"
+        cleanup()
     timestamp, serverTimestamp = msg[1], msg[2]
-    #! TODO add verifyTimeStamp
+    if not verifyTimeStamp(serverTimestamp):
+        print 'Found Replay attack, Dropping packet!!'
+        cleanup()
     loginMsg3 = pickle.dumps(('LOGIN3', serverTimestamp, clientsock.socket.getsockname()))
     encryptSend(loginMsg3)
 
@@ -364,10 +468,10 @@ def getLoginResponse():
     server.socket.settimeout(None)
     return loginResponse
 
+# Encrypt and send the data to server
 def encryptSend(data):
-    authString = b"ChatApp"
-    iv, cipherText, encryptorTag = encryptDataWithAESGCM(server.symmKey, data, authString)
-    dataToBeSentToServer = iv + '<<>>' + cipherText + '<<>>' + encryptorTag + '<<>>' + authString
+    iv, cipherText, encryptorTag = encryptDataWithAESGCM(server.symmKey, data)
+    dataToBeSentToServer = iv + '<<>>' + cipherText + '<<>>' + encryptorTag
     server.socket.send(dataToBeSentToServer)
 
 def saltedPasswordHash(password, salt):
@@ -376,15 +480,15 @@ def saltedPasswordHash(password, salt):
                      backend = default_backend())
     return base64.urlsafe_b64encode(kdf.derive(password))
 
+# Decrypt the data using AES
 def decryptDataWithAES(data,symmKey):
     try:
         parts = data.split('<<>>')
-        iv,cipherText,encryptorTag, authString = parts[0], parts[1], parts[2], parts[3]
+        iv,cipherText,encryptorTag = parts[0], parts[1], parts[2]#, parts[3]
         decryptor = Cipher(algorithms.AES(symmKey),modes.GCM(iv, encryptorTag),backend=default_backend()).decryptor()
-        decryptor.authenticate_additional_data(authString)
+        #decryptor.authenticate_additional_data(authString)
         return decryptor.update(cipherText) + decryptor.finalize()
     except Exception as e:
-        raise
         print "Error in Decrypting the data!!"
         cleanup()
 
@@ -399,6 +503,7 @@ def RSADecryption(cipherKey):
                      algorithm=hashes.SHA1(), label=None))
     return symmetricKey
 
+# RSA Encryption
 def RSAEncryption(data):
     try:
         cipherKey = asymKeys.serverPublicKey.encrypt(data,
@@ -409,17 +514,19 @@ def RSAEncryption(data):
         print "Error in RSA encryption! Aborting the client application!"
         cleanup()
 
-def encryptDataWithAESGCM(key, data, authString):
+# AES Encryption
+def encryptDataWithAESGCM(key, data):#, authString):
     try:
         iv = os.urandom(32)
         encryptor = Cipher(algorithms.AES(key),modes.GCM(iv),backend=default_backend()).encryptor()
-        encryptor.authenticate_additional_data(authString)
+        #encryptor.authenticate_additional_data(authString)
         ciphertext = encryptor.update(data) + encryptor.finalize()
         return (iv, ciphertext, encryptor.tag)
     except:
         print "Error in Encrypting the data! Aborting the client application!!"
         cleanup()
 
+# Function to solve the server's challenge
 def solveChallenge(serverSock):
     challenge = serverSock.socket.recv(1024)
     addr = serverSock.socket.getsockname()[0]
@@ -434,6 +541,8 @@ def solveChallenge(serverSock):
             serverSock.challengeResponse = index
             break
 
+# class keys
+# This is responsible for generating keys and retriving server public key
 class keys:
     def __init__(self):
         key = generateClientRSAKeys()
@@ -472,7 +581,6 @@ def retrieveServerPublicKey():
 
 # CleanUp before exiting. Wait for threads to finish jobs and close socket
 def cleanup():
-    #!TODO Possible race condition during login
     rThread.shutdown()
     rThread.join()
     server.serverClose()
@@ -480,6 +588,7 @@ def cleanup():
     print "Terminating Client..."
     sys.exit(0)
 
+# Main function awaits for user input
 def main():
     signal.signal(signal.SIGINT, signal_handler)
     signal.signal(signal.SIGTERM, signal_handler)
@@ -495,23 +604,31 @@ def main():
         elif cmd == 'logout':
             cleanup()
 
+# Handle user send command
 def handleSendCmd(peerUser, msg):
+    timestamp = generateCurrentTime()
+    if peerUser == server.username:
+        flush("Messaging self???"+'\n',False)
+        return
+    if peerUser in peerSockMap.keys():
+        message = ' '.join(msg)
+        digest = hashes.Hash(hashes.SHA256(), backend=default_backend())
+        digest.update(message)
+        hashMessage = digest.finalize()
+        data = pickle.dumps((timestamp, message, hashMessage, server.username))
+        iv, cipherText, encryptorTag = encryptDataWithAESGCM(peerKeyMap[peerSockMap[peerUser]][0], data)
+        dataToPeer = iv + '<<>>' + cipherText + '<<>>' + encryptorTag
+        peerSockMap[peerUser].send(dataToPeer)
+        return
     if server.socket not in sockList:
         flush("Server not Available"+'\n',False)
-        return
-    timestamp = generateCurrentTime()
-    if peerUser in peerSockMap.keys():
-        data = pickle.dumps(msg)
-        authString = b"ChatApp"
-        iv, cipherText, encryptorTag = encryptDataWithAESGCM(peerKeyMap[peerSockMap[peerUser]], data, authString)
-        dataToPeer = iv + '<<>>' + cipherText + '<<>>' + encryptorTag + '<<>>' + authString
-        peerSockMap[peerUser].send(dataToPeer)
         return
     data = pickle.dumps(('SEND', timestamp, server.username, peerUser))
     encryptSend(data)
     global firstMsg
-    firstMsg = msg
+    firstMsg = ' '.join(msg)
 
+# handle user list command
 def handleListCmd():
     if server.socket not in sockList:
         flush("Server not Available"+'\n',False)
@@ -520,6 +637,7 @@ def handleListCmd():
     data = pickle.dumps(('LIST', timestamp, server.username))
     encryptSend(data)
 
+# Function to check the validity of the command
 def isCommand (cmd):
     if (len(cmd) == 1 and cmd[0] == 'list') or\
         (len(cmd) == 1 and cmd[0] == 'logout') or\
